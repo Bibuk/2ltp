@@ -1,0 +1,119 @@
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+
+from app.config import settings
+from app.limiter import limiter
+
+logging.basicConfig(
+    level=logging.DEBUG if not settings.is_production else logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application startup/shutdown lifecycle."""
+    logger.info(f"Starting 2LTP backend [env={settings.APP_ENV}]...")
+    import os
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    yield
+    logger.info("Shutting down 2LTP backend...")
+
+
+app = FastAPI(
+    title="2LTP Task Portal API",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url=settings.docs_url,
+    redoc_url=settings.redoc_url,
+    openapi_url=settings.openapi_url,
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_MUTATING_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
+_BROADCAST_PATHS = ("/api/tasks", "/api/tickets", "/api/subtasks", "/api/comments")
+
+
+@app.middleware("http")
+async def broadcast_data_changes(request: Request, call_next):
+    """After any successful mutation of shared data, notify every connected
+    client to refresh — gives all roles real-time updates, not just whoever
+    received a personal notification."""
+    response = await call_next(request)
+    try:
+        path = request.url.path
+        if (
+            request.method in _MUTATING_METHODS
+            and response.status_code < 400
+            and any(path.startswith(p) for p in _BROADCAST_PATHS)
+        ):
+            parts = path.split("/")
+            entity = parts[2] if len(parts) > 2 else "data"
+            from app.services.notification import ws_manager
+            await ws_manager.broadcast({"type": "data_change", "entity": entity})
+    except Exception:
+        pass
+    return response
+
+from app.routers import (
+    auth,
+    users,
+    teams,
+    applications,
+    services,
+    tickets,
+    tasks,
+    subtasks,
+    comments,
+    notifications,
+    analytics,
+    audit_log,
+    websocket,
+)
+
+app.include_router(auth.router)
+app.include_router(users.router)
+app.include_router(teams.router)
+app.include_router(applications.router)
+app.include_router(services.router)
+app.include_router(tickets.router)
+app.include_router(tasks.router)
+app.include_router(subtasks.router)
+app.include_router(comments.router)
+app.include_router(notifications.router)
+app.include_router(analytics.router)
+app.include_router(audit_log.router)
+app.include_router(websocket.router)
+
+
+@app.get("/health", tags=["health"], include_in_schema=not settings.is_production)
+async def health():
+    return {"status": "ok", "version": "1.0.0", "env": settings.APP_ENV}
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled error on {request.method} {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error"},
+    )
